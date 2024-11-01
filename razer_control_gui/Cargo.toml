@@ -9,11 +9,11 @@ edition = "2018"
 
 [[bin]]
 name = "razer-cli"
-path = "src/cli.rs"
+path = "src/cli/cli.rs"
 
 [[bin]]
 name = "daemon"
-path = "src/daemon.rs"
+path = "src/daemon/daemon.rs"
 
 [[bin]]
 name = "razer-settings"
@@ -38,3 +38,5 @@ serde-big-array = "0.5.1"
 clap = { version = "4.4.13", features = ["derive"] }
 gtk = "0.18.1"
 glib = "0.19.7"
+log = "0.4.22"
+env_logger = "0.11.5"

@@ -1,24 +1,28 @@
-mod comms;
-mod config;
-// mod driver_sysfs;
-mod kbd;
-mod device;
-use crate::kbd::Effect;
-// use bincode::Options;
-use lazy_static::lazy_static;
-use signal_hook::{iterator::Signals, consts::SIGINT, consts::SIGTERM};
-// use std::io::prelude::*;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use dbus::{blocking::Connection, arg};
-use dbus::Message;
 use std::sync::Mutex;
-use std::{thread, time};
+use std::thread::{self, JoinHandle};
+use std::time;
+
+use log::*;
+use lazy_static::lazy_static;
+use signal_hook::iterator::Signals;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use dbus::blocking::Connection;
+use dbus::{Message, arg};
+
+#[path = "../comms.rs"]
+mod comms;
+mod config;
+mod kbd;
+mod device;
 mod battery;
 mod dbus_mutter_displayconfig;
 mod dbus_mutter_idlemonitor;
 mod screensaver;
 mod login1;
+
+use crate::kbd::Effect;
 
 lazy_static! {
     static ref EFFECT_MANAGER: Mutex<kbd::EffectManager> = Mutex::new(kbd::EffectManager::new());
@@ -39,6 +43,7 @@ lazy_static! {
 // Main function for daemon
 fn main() {
     setup_panic_hook();
+    init_logging();
 
     if let Ok(mut d) = DEV_MANAGER.lock() {
         d.discover_devices();
@@ -60,7 +65,7 @@ fn main() {
         let proxy_ac = dbus_system.with_proxy("org.freedesktop.UPower", "/org/freedesktop/UPower/devices/line_power_AC0", time::Duration::from_millis(5000));
         use battery::OrgFreedesktopUPowerDevice;
         if let Ok(online) = proxy_ac.online() {
-            println!("Online AC0: {:?}", online);
+            info!("AC0 online: {:?}", online);
             d.set_ac_state(online);
             d.restore_standard_effect();
             if let Ok(json) = config::Configuration::read_effects_file() {
@@ -79,16 +84,60 @@ fn main() {
         }
     }
 
+    start_keyboard_animator_task();
+    start_screensaver_monitor_task();
+    start_battery_monitor_task();
+    let clean_thread = start_shutdown_task();
+
+    if let Some(listener) = comms::create() {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_data(stream),
+                Err(_) => {} // Don't care about this
+            }
+        }
+    } else {
+        eprintln!("Could not create Unix socket!");
+        std::process::exit(1);
+    }
+    clean_thread.join().unwrap();
+}
+
+/// Installs a custom panic hook to perform cleanup when the daemon crashes
+fn setup_panic_hook() {
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        error!("Something went wrong! Removing the socket path");
+        if std::fs::metadata(comms::SOCKET_PATH).is_ok() {
+            std::fs::remove_file(comms::SOCKET_PATH).unwrap();
+        }
+        default_panic_hook(info);
+    }));
+}
+
+fn init_logging() {
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.target(env_logger::Target::Stderr);
+    builder.filter_level(log::LevelFilter::Info);
+    builder.format_timestamp_millis();
+    builder.parse_env("RAZER_LAPTOP_CONTROL_LOG");
+    builder.init();
+}
+
+/// Handles keyboard animations
+pub fn start_keyboard_animator_task() -> JoinHandle<()> {
     // Start the keyboard animator thread,
-    thread::spawn(move || {
+    thread::spawn(|| {
         loop {
             if let Some(laptop) = DEV_MANAGER.lock().unwrap().get_device() {
                 EFFECT_MANAGER.lock().unwrap().update(laptop);
             }
-            std::thread::sleep(std::time::Duration::from_millis(kbd::ANIMATION_SLEEP_MS));
+            thread::sleep(std::time::Duration::from_millis(kbd::ANIMATION_SLEEP_MS));
         }
-    });
+    })
+}
 
+fn start_screensaver_monitor_task() -> JoinHandle<()> {
     thread::spawn(move || {
         let dbus_session = Connection::new_session()
             .expect("failed to connect to D-Bus session bus");
@@ -149,16 +198,37 @@ fn main() {
             }
         }
 
-    });
+    })
+}
 
+fn start_battery_monitor_task() -> JoinHandle<()> {
     thread::spawn(move || {
         let dbus_system = Connection::new_system()
-            .expect("failed to connect to D-Bus system bus");
-        let proxy_ac = dbus_system.with_proxy("org.freedesktop.UPower", "/org/freedesktop/UPower/devices/line_power_AC0", time::Duration::from_millis(5000));
+            .expect("should be able to connect to D-Bus system bus");
+        info!("Connected to the system D-Bus");
+
+        let proxy_ac = dbus_system.with_proxy(
+            "org.freedesktop.UPower",
+            "/org/freedesktop/UPower/devices/line_power_AC0",
+            time::Duration::from_millis(5000)
+        );
+
+        let proxy_battery = dbus_system.with_proxy(
+            "org.freedesktop.UPower",
+            "/org/freedesktop/UPower/devices/battery_BAT0",
+            time::Duration::from_millis(5000)
+        );
+
+        let proxy_login = dbus_system.with_proxy(
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            time::Duration::from_millis(5000)
+        );
+
         let _id = proxy_ac.match_signal(|h: battery::OrgFreedesktopDBusPropertiesPropertiesChanged, _: &Connection, _: &Message| {
             let online: Option<&bool> = arg::prop_cast(&h.changed_properties, "Online");
             if let Some(online) = online {
-                println!("Online AC0: {:?}", online);
+                info!("AC0 online: {:?}", online);
                 if let Ok(mut d) = DEV_MANAGER.lock() {
                     d.set_ac_state(*online);
                 }
@@ -166,22 +236,16 @@ fn main() {
             true
         });
 
-        let proxy_battery = dbus_system.with_proxy("org.freedesktop.UPower", "/org/freedesktop/UPower/devices/battery_BAT0", time::Duration::from_millis(5000));
-        // use battery::OrgFreedesktopUPowerDevice;
-        // if let Ok(perc) = proxy_battery.percentage() {
-            // println!("battery percentage: {:.1}", perc);
-        // }
         let _id = proxy_battery.match_signal(|h: battery::OrgFreedesktopDBusPropertiesPropertiesChanged, _: &Connection, _: &Message| {
             let perc: Option<&f64> = arg::prop_cast(&h.changed_properties, "Percentage");
             if let Some(perc) = perc {
-                println!("battery percentage: {:.1}", perc);
+                info!("Battery percentage: {:.1}", perc);
             }
             true
         });
 
-        let proxy_login = dbus_system.with_proxy("org.freedesktop.login1", "/org/freedesktop/login1", time::Duration::from_millis(5000));
         let _id = proxy_login.match_signal(|h: login1::OrgFreedesktopLogin1ManagerPrepareForSleep, _: &Connection, _: &Message| {
-            println!("PrepareForSleep {:?}", h.start);
+            info!("PrepareForSleep {:?}", h.start);
             if let Ok(mut d) = DEV_MANAGER.lock() {
                 d.set_ac_state_get();
                 if h.start {
@@ -192,52 +256,28 @@ fn main() {
             }
             true
         });
-        // use login1::OrgFreedesktopLogin1ManagerPrepareForSleep;
-        loop { dbus_system.process(time::Duration::from_millis(1000)).unwrap(); }
-    });
 
-    // Signal handler - cleanup if we are told to exit
-    let mut signals = Signals::new([SIGINT, SIGTERM]).unwrap();
-    let clean_thread = thread::spawn(move || {
+        loop { dbus_system.process(time::Duration::from_millis(1000)).unwrap(); }
+    })
+}
+
+/// Monitors signals and stops the daemon when receiving one
+pub fn start_shutdown_task() -> JoinHandle<()> {
+    thread::spawn(|| {
+        let mut signals = Signals::new([SIGINT, SIGTERM]).unwrap();
         let _ = signals.forever().next();
         
         // If we reach this point, we have a signal and it is time to exit
         println!("Received signal, cleaning up");
         let json = EFFECT_MANAGER.lock().unwrap().save();
-        if let Err(e) = config::Configuration::write_effects_save(json) {
-            eprintln!("Error write config {:?}", e);
+        if let Err(error) = config::Configuration::write_effects_save(json) {
+            error!("Error writing config {}", error);
         }
         if std::fs::metadata(comms::SOCKET_PATH).is_ok() {
             std::fs::remove_file(comms::SOCKET_PATH).unwrap();
         }
         std::process::exit(0);
-    });
-
-
-    if let Some(listener) = comms::create() {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => handle_data(stream),
-                Err(_) => {} // Don't care about this
-            }
-        }
-    } else {
-        eprintln!("Could not create Unix socket!");
-        std::process::exit(1);
-    }
-    clean_thread.join().unwrap();
-}
-
-/// Installs a custom panic hook to perform cleanup when the daemon crashes
-fn setup_panic_hook() {
-    let default_panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        println!("Something went wrong! Removing the socket path");
-        if std::fs::metadata(comms::SOCKET_PATH).is_ok() {
-            std::fs::remove_file(comms::SOCKET_PATH).unwrap();
-        }
-        default_panic_hook(info);
-    }));
+    })
 }
 
 fn handle_data(mut stream: UnixStream) {
