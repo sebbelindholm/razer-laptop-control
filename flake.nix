@@ -2,8 +2,8 @@
   description = "razer-laptop-control";
 
   inputs = {
-    flake-utils.url = "github:numtide/flake-utils";
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs =
@@ -38,7 +38,7 @@
           src = ./razer_control_gui;
 
           postConfigure = ''
-            substituteInPlace src/device.rs --replace '/usr/share/razercontrol/laptops.json' '${./razer_control_gui/data/devices/laptops.json}'
+            substituteInPlace src/daemon/device.rs --replace '/usr/share/razercontrol/laptops.json' '${./razer_control_gui/data/devices/laptops.json}'
           '';
 
           postBuild =
